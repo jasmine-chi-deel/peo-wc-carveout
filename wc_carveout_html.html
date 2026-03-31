@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>WC Carveout Tracker</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f3; color: #1a1a1a; min-height: 100vh; }
+  input, select, button { font-family: inherit; }
+  input[type=text], input[type=date], select {
+    width: 100%; padding: 7px 10px; font-size: 14px;
+    border: 0.5px solid #ccc; border-radius: 8px;
+    background: #fff; color: #1a1a1a; outline: none;
+  }
+  input[type=text]:focus, input[type=date]:focus, select:focus { border-color: #888; }
+  button { cursor: pointer; }
+  table { border-collapse: collapse; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+const CLIENT_STATUS = ["Active", "Churned", "Abandoned", "Pending"];
+const RENEWAL_STATUS = ["In Progress", "Expiring Soon", "Completed"];
+const STATUS_COLORS = {
+  Active:    { bg:"#EAF3DE", text:"#3B6D11", border:"#639922" },
+  Churned:   { bg:"#FCEBEB", text:"#A32D2D", border:"#E24B4A" },
+  Abandoned: { bg:"#F1EFE8", text:"#5F5E5A", border:"#888780" },
+  Pending:   { bg:"#FAEEDA", text:"#854F0B", border:"#BA7517" },
+};
+const RENEWAL_COLORS = {
+  "In Progress":   { bg:"#E6F1FB", text:"#185FA5" },
+  "Expiring Soon": { bg:"#FAEEDA", text:"#854F0B" },
+  "Completed":     { bg:"#EAF3DE", text:"#3B6D11" },
+};
+const FIELDS = [
+  { key:"entityName",    label:"Entity Name",    required:true },
+  { key:"orgId",         label:"ORG ID" },
+  { key:"prismId",       label:"Prism ID" },
+  { key:"expirationDate",label:"Expiration Date" },
+  { key:"clientStatus",  label:"Client Status" },
+  { key:"renewalStatus", label:"Renewal Status" },
+];
+const EMPTY = { entityName:"", orgId:"", prismId:"", expirationDate:"", clientStatus:"Active", renewalStatus:"In Progress" };
+const STORAGE_KEY = "wc_carveout_entries";
+
+function parseDate(val) {
+  if (!val) return "";
+  const n = parseFloat(val);
+  if (!isNaN(n) && n > 1000 && n < 100000)
+    return new Date(Math.round((n-25569)*86400*1000)).toISOString().split("T")[0];
+  const d = new Date(val);
+  return !isNaN(d.getTime()) ? d.toISOString().split("T")[0] : val;
+}
+function normStatus(val, opts) {
+  if (!val) return opts[0];
+  const v = val.trim().toLowerCase();
+  return opts.find(o => o.toLowerCase()===v) || opts.find(o => o.toLowerCase().startsWith(v[0])) || opts[0];
+}
+function guessMap(headers) {
+  const rules = { entityName:["entity","name","company","client","account"], orgId:["org","orgid","org_id"], prismId:["prism","prismid"], expirationDate:["expir","exp date","expdate","date"], clientStatus:["client status","status"], renewalStatus:["renewal status","renewal"] };
+  const map = {};
+  headers.forEach((h,i) => { const hl=h.toLowerCase().trim(); for (const [f,kws] of Object.entries(rules)) { if (!map[f]&&kws.some(k=>hl.includes(k))) map[f]=i.toString(); }});
+  return map;
+}
+function fmtDate(d) {
+  if (!d) return "";
+  return new Date(d+"T00:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"});
+}
+function computeRenewal(e) {
+  if (e.renewalStatus==="Completed") return "Completed";
+  if (e.expirationDate) { const diff=(new Date(e.expirationDate)-new Date())/86400000; if(diff>=0&&diff<=30) return "Expiring Soon"; }
+  return e.renewalStatus==="Expiring Soon" ? "In Progress" : (e.renewalStatus||"In Progress");
+}
+
+function TextCell({ value, onChange, bold }) {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(value);
+  const ref = useRef();
+  useEffect(()=>setVal(value),[value]);
+  useEffect(()=>{ if(editing&&ref.current) ref.current.focus(); },[editing]);
+  const commit = v => { setEditing(false); onChange(v); };
+  if (editing) return <input ref={ref} value={val} onChange={e=>setVal(e.target.value)} onBlur={()=>commit(val)} onKeyDown={e=>{ if(e.key==="Enter") commit(val); if(e.key==="Escape"){setEditing(false);setVal(value);}}} style={{ width:"100%",padding:"3px 6px",fontSize:13,border:"1px solid #ccc",borderRadius:6,fontWeight:bold?500:400 }} />;
+  return (
+    <span onClick={()=>setEditing(true)} title="Click to edit"
+      style={{ cursor:"text",display:"block",minHeight:22,padding:"2px 4px",fontWeight:bold?500:400,color:value?"inherit":"#aaa",borderBottom:"1px dashed transparent" }}
+      onMouseEnter={e=>e.currentTarget.style.borderBottomColor="#ccc"}
+      onMouseLeave={e=>e.currentTarget.style.borderBottomColor="transparent"}>
+      {value || "—"}
+    </span>
+  );
+}
+
+function DateCell({ value, onChange }) {
+  const [editing, setEditing] = useState(false);
+  const ref = useRef();
+  useEffect(()=>{ if(editing&&ref.current) ref.current.focus(); },[editing]);
+  const expired = value && new Date(value)<new Date();
+  const soon = value && !expired && (new Date(value)-new Date())/86400000<=30;
+  if (editing) return <input ref={ref} type="date" defaultValue={value} onBlur={e=>{setEditing(false);onChange(e.target.value);}} onKeyDown={e=>{ if(e.key==="Enter") e.target.blur(); if(e.key==="Escape") setEditing(false); }} style={{ padding:"3px 6px",fontSize:12,border:"1px solid #ccc",borderRadius:6 }} />;
+  return (
+    <span onClick={()=>setEditing(true)} title="Click to edit"
+      style={{ cursor:"text",display:"block",fontSize:12,minHeight:22,padding:"2px 4px",color:expired?"#A32D2D":soon?"#854F0B":"#1a1a1a",fontWeight:(expired||soon)?500:400,borderBottom:"1px dashed transparent" }}
+      onMouseEnter={e=>e.currentTarget.style.borderBottomColor="#ccc"}
+      onMouseLeave={e=>e.currentTarget.style.borderBottomColor="transparent"}>
+      {value ? <>{expired?"⚠ ":soon?"⏱ ":""}{fmtDate(value)}</> : <span style={{color:"#aaa"}}>—</span>}
+    </span>
+  );
+}
+
+function SelectCell({ value, options, colors, onChange, locked }) {
+  const [editing, setEditing] = useState(false);
+  const ref = useRef();
+  useEffect(()=>{ if(editing&&ref.current) ref.current.focus(); },[editing]);
+  const c = colors[value]||{};
+  if (editing) return <select ref={ref} value={value} onChange={e=>{onChange(e.target.value);setEditing(false);}} onBlur={()=>setEditing(false)} style={{ padding:"3px 6px",fontSize:12,border:"1px solid #ccc",borderRadius:6 }}>{options.filter(o=>o!=="Expiring Soon").map(o=><option key={o}>{o}</option>)}</select>;
+  return (
+    <span onClick={()=>!locked&&setEditing(true)} title={locked?"Auto-managed":"Click to edit"}
+      style={{ cursor:locked?"default":"pointer",display:"inline-flex",alignItems:"center",gap:4,padding:"3px 9px",borderRadius:20,fontSize:12,fontWeight:500,background:c.bg,color:c.text,border:c.border?`0.5px solid ${c.border}`:"none" }}>
+      {locked&&<span style={{fontSize:10}}>⚡</span>}{value}
+    </span>
+  );
+}
+
+function App() {
+  const [entries, setEntries] = useState([]);
+  const [form, setForm] = useState(EMPTY);
+  const [showForm, setShowForm] = useState(false);
+  const [filterClient, setFilterClient] = useState("All");
+  const [filterRenewal, setFilterRenewal] = useState("All");
+  const [search, setSearch] = useState("");
+  const [sortConfig, setSortConfig] = useState({ key:null, dir:"asc" });
+  const [showImport, setShowImport] = useState(false);
+  const [importStep, setImportStep] = useState(null);
+  const [importHeaders, setImportHeaders] = useState([]);
+  const [importRows, setImportRows] = useState([]);
+  const [mapping, setMapping] = useState({});
+  const [importMode, setImportMode] = useState("append");
+  const [importPreview, setImportPreview] = useState([]);
+  const fileRef = useRef();
+
+  useEffect(() => {
+    try { const raw = localStorage.getItem(STORAGE_KEY); if (raw) setEntries(JSON.parse(raw)); } catch {}
+  }, []);
+
+  function save(updated) {
+    setEntries(updated);
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(updated)); } catch {}
+  }
+
+  function updateField(id, key, value) {
+    save(entries.map(e => { if(e.id!==id) return e; const u={...e,[key]:value}; u.renewalStatus=computeRenewal(u); return u; }));
+  }
+
+  function handleAdd() {
+    if (!form.entityName.trim()) return;
+    const entry = { ...form, id: Date.now() };
+    entry.renewalStatus = computeRenewal(entry);
+    save([...entries, entry]);
+    setForm(EMPTY); setShowForm(false);
+  }
+
+  function handleDelete(id) { save(entries.filter(e=>e.id!==id)); }
+  function handleSort(key) { setSortConfig(p=>p.key===key?{key,dir:p.dir==="asc"?"desc":"asc"}:{key,dir:"asc"}); }
+
+  function exportCSV() {
+    const hdr = ["Entity Name","ORG ID","Prism ID","Expiration Date","Client Status","Renewal Status"];
+    const rows = entries.map(e=>[e.entityName,e.orgId,e.prismId,e.expirationDate,e.clientStatus,e.renewalStatus].map(v=>`"${(v||"").replace(/"/g,'""')}"`));
+    const csv = [hdr.join(","),...rows.map(r=>r.join(","))].join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
+    a.download = `wc_carveout_${new Date().toISOString().split("T")[0]}.csv`;
+    a.click();
+  }
+
+  function handleFile(e) {
+    const file = e.target.files[0]; if(!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      let rows=[];
+      if (file.name.endsWith(".csv")) {
+        rows=ev.target.result.split(/\r?\n/).filter(r=>r.trim()).map(r=>{const cols=[];let cur="";let inQ=false;for(let i=0;i<r.length;i++){if(r[i]==='"')inQ=!inQ;else if(r[i]===','&&!inQ){cols.push(cur.trim());cur="";}else cur+=r[i];}cols.push(cur.trim());return cols;});
+      } else { const wb=XLSX.read(ev.target.result,{type:"binary"}); rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:""}); }
+      if (!rows.length) return;
+      const headers=rows[0].map(h=>String(h));
+      const dataRows=rows.slice(1).filter(r=>r.some(c=>c!==""&&c!==null&&c!==undefined));
+      setImportHeaders(headers); setImportRows(dataRows); setMapping(guessMap(headers)); setImportStep("mapping");
+    };
+    if (file.name.endsWith(".csv")) reader.readAsText(file); else reader.readAsBinaryString(file);
+    e.target.value="";
+  }
+
+  function buildMapped(rows) {
+    return rows.map((row,i)=>{
+      const entry={...EMPTY,id:Date.now()+i};
+      FIELDS.forEach(f=>{ const idx=mapping[f.key]; if(idx!==undefined&&idx!==""){const val=String(row[parseInt(idx)]||"").trim();if(f.key==="expirationDate")entry[f.key]=parseDate(val);else if(f.key==="clientStatus")entry[f.key]=normStatus(val,CLIENT_STATUS);else if(f.key==="renewalStatus")entry[f.key]=normStatus(val,RENEWAL_STATUS);else entry[f.key]=val;}});
+      entry.renewalStatus=computeRenewal(entry); return entry;
+    }).filter(e=>e.entityName);
+  }
+
+  function confirmImport() {
+    const ne=buildMapped(importRows);
+    save(importMode==="replace"?ne:[...entries,...ne]);
+    setImportStep(null); setImportHeaders([]); setImportRows([]); setMapping({}); setShowImport(false);
+  }
+
+  const filtered = entries
+    .filter(e=>filterClient==="All"||e.clientStatus===filterClient)
+    .filter(e=>filterRenewal==="All"||e.renewalStatus===filterRenewal)
+    .filter(e=>!search||e.entityName.toLowerCase().includes(search.toLowerCase())||(e.orgId||"").toLowerCase().includes(search.toLowerCase())||(e.prismId||"").toLowerCase().includes(search.toLowerCase()))
+    .sort((a,b)=>{ if(!sortConfig.key) return 0; return sortConfig.dir==="asc"?(a[sortConfig.key]||"").localeCompare(b[sortConfig.key]||""):(b[sortConfig.key]||"").localeCompare(a[sortConfig.key]||""); });
+
+  const expiringSoon = entries.filter(e=>{ if(!e.expirationDate) return false; const d=(new Date(e.expirationDate)-new Date())/86400000; return d>=0&&d<=30; }).length;
+  const counts = {Active:0,Pending:0,Churned:0,Abandoned:0};
+  entries.forEach(e=>{ if(counts[e.clientStatus]!==undefined) counts[e.clientStatus]++; });
+
+  const card = { background:"#fff", border:"0.5px solid #ddd", borderRadius:12, padding:"1.25rem", marginBottom:"1.25rem" };
+  const inp2 = { width:"100%", padding:"7px 10px", fontSize:14, border:"0.5px solid #ccc", borderRadius:8 };
+  const btn = { padding:"8px 16px", fontSize:13, fontWeight:500, border:"0.5px solid #ccc", borderRadius:8, background:"#fff", color:"#1a1a1a", cursor:"pointer" };
+  const cols = [{key:"entityName",label:"Entity Name"},{key:"orgId",label:"ORG ID"},{key:"prismId",label:"Prism ID"},{key:"expirationDate",label:"Expiration Date"},{key:"clientStatus",label:"Client Status"},{key:"renewalStatus",label:"Renewal Status"}];
+
+  return (
+    <div style={{ maxWidth:1100, margin:"0 auto", padding:"2rem 1rem" }}>
+      {/* Header */}
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:"1.5rem" }}>
+        <div>
+          <h1 style={{ fontSize:22, fontWeight:500, margin:0 }}>WC Carveout Tracker</h1>
+          <p style={{ fontSize:13, color:"#888", margin:"2px 0 0" }}>{entries.length} clients · saved locally</p>
+        </div>
+        <div style={{ display:"flex", gap:8 }}>
+          <button onClick={exportCSV} style={{ ...btn, background:"#f5f5f3" }}>↓ Export CSV</button>
+          <button onClick={()=>{ setShowImport(!showImport); setImportStep(null); }} style={{ ...btn, background:"#f5f5f3", fontSize:12, color:"#888" }}>Import</button>
+          <button onClick={()=>{ setShowForm(!showForm); setForm(EMPTY); }} style={{ ...btn, background: showForm?"#f0f0f0":"#fff" }}>{showForm?"Cancel":"+ Add Client"}</button>
+        </div>
+      </div>
+
+      {/* Summary cards */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:"1.25rem" }}>
+        {Object.entries(counts).map(([s,n])=>(
+          <div key={s} style={{ background:"#fff", border:"0.5px solid #ddd", borderRadius:8, padding:"12px 14px" }}>
+            <div style={{ fontSize:12, color:"#888", marginBottom:4 }}>{s}</div>
+            <div style={{ fontSize:22, fontWeight:500 }}>{n}</div>
+          </div>
+        ))}
+      </div>
+
+      {expiringSoon>0 && <div style={{ background:"#FAEEDA", border:"0.5px solid #BA7517", borderRadius:8, padding:"10px 14px", marginBottom:"1rem", fontSize:13, color:"#854F0B" }}>⚠ {expiringSoon} client{expiringSoon>1?"s":""} expiring within 30 days</div>}
+
+      {/* Add form */}
+      {showForm && (
+        <div style={card}>
+          <h3 style={{ fontSize:15, fontWeight:500, marginBottom:"1rem" }}>Add new client</h3>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"12px 16px" }}>
+            {[["entityName","Entity Name","text"],["orgId","ORG ID","text"],["prismId","Prism ID","text"],["expirationDate","Expiration Date","date"]].map(([k,lbl,type])=>(
+              <div key={k}>
+                <label style={{ fontSize:12, color:"#888", display:"block", marginBottom:4 }}>{lbl}</label>
+                <input type={type} value={form[k]} onChange={e=>setForm(f=>({...f,[k]:e.target.value}))} style={inp2} />
+              </div>
+            ))}
+            <div>
+              <label style={{ fontSize:12, color:"#888", display:"block", marginBottom:4 }}>Client Status</label>
+              <select value={form.clientStatus} onChange={e=>setForm(f=>({...f,clientStatus:e.target.value}))} style={inp2}>{CLIENT_STATUS.map(s=><option key={s}>{s}</option>)}</select>
+            </div>
+            <div>
+              <label style={{ fontSize:12, color:"#888", display:"block", marginBottom:4 }}>Renewal Status <span style={{fontSize:11,color:"#aaa"}}>(auto-managed)</span></label>
+              <select value={form.renewalStatus} onChange={e=>setForm(f=>({...f,renewalStatus:e.target.value}))} style={inp2}>{RENEWAL_STATUS.filter(s=>s!=="Expiring Soon").map(s=><option key={s}>{s}</option>)}</select>
+            </div>
+          </div>
+          <div style={{ display:"flex", gap:8, marginTop:"1rem" }}>
+            <button onClick={handleAdd} style={btn}>Add client</button>
+            <button onClick={()=>setShowForm(false)} style={{ ...btn, color:"#888" }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Import */}
+      {showImport && !importStep && (
+        <div style={{ ...card, background:"#fafafa", border:"0.5px solid #eee" }}>
+          <p style={{ fontWeight:500, marginBottom:8 }}>One-time import</p>
+          <p style={{ fontSize:13, color:"#888", marginBottom:12 }}>Seed the tracker from an existing spreadsheet. After importing, manage everything directly here.</p>
+          <button onClick={()=>fileRef.current.click()} style={btn}>Choose file (.csv, .xlsx)</button>
+          <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" onChange={handleFile} style={{ display:"none" }} />
+        </div>
+      )}
+      {importStep==="mapping" && (
+        <div style={card}>
+          <h3 style={{ fontSize:15, fontWeight:500, marginBottom:4 }}>Map your columns</h3>
+          <p style={{ fontSize:13, color:"#888", marginBottom:"1rem" }}>{importRows.length} rows detected.</p>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"10px 20px", marginBottom:"1rem" }}>
+            {FIELDS.map(f=>(
+              <div key={f.key}>
+                <label style={{ fontSize:12, color:"#888", display:"block", marginBottom:4 }}>{f.label}{f.required&&<span style={{color:"#E24B4A"}}> *</span>}</label>
+                <select value={mapping[f.key]??""} onChange={e=>setMapping(m=>({...m,[f.key]:e.target.value}))} style={inp2}>
+                  <option value="">— skip —</option>
+                  {importHeaders.map((h,i)=><option key={i} value={i.toString()}>{h}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginBottom:"1rem" }}>
+            {["append","replace"].map(m=>(
+              <label key={m} style={{ fontSize:13, display:"inline-flex", alignItems:"center", gap:6, marginRight:16, cursor:"pointer" }}>
+                <input type="radio" name="imode" value={m} checked={importMode===m} onChange={()=>setImportMode(m)} />
+                {m==="append"?"Add to existing":"Replace all"}
+              </label>
+            ))}
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            <button onClick={()=>{ setImportPreview(buildMapped(importRows.slice(0,5))); setImportStep("preview"); }} style={btn}>Preview →</button>
+            <button onClick={()=>{ setImportStep(null); setShowImport(false); }} style={{ ...btn, color:"#888" }}>Cancel</button>
+          </div>
+        </div>
+      )}
+      {importStep==="preview" && (
+        <div style={card}>
+          <h3 style={{ fontSize:15, fontWeight:500, marginBottom:4 }}>Preview (first 5 rows)</h3>
+          <p style={{ fontSize:13, color:"#888", marginBottom:"1rem" }}>Importing {importRows.length} rows total.</p>
+          <div style={{ overflowX:"auto", marginBottom:"1rem" }}>
+            <table style={{ width:"100%", fontSize:12 }}>
+              <thead><tr>{FIELDS.map(f=><th key={f.key} style={{ padding:"6px 10px", textAlign:"left", fontWeight:500, color:"#888", borderBottom:"0.5px solid #eee" }}>{f.label}</th>)}</tr></thead>
+              <tbody>{importPreview.map((row,i)=>(
+                <tr key={i} style={{ borderBottom:"0.5px solid #eee" }}>
+                  <td style={{padding:"7px 10px"}}>{row.entityName||"—"}</td>
+                  <td style={{padding:"7px 10px",color:"#888"}}>{row.orgId||"—"}</td>
+                  <td style={{padding:"7px 10px",color:"#888"}}>{row.prismId||"—"}</td>
+                  <td style={{padding:"7px 10px",color:"#888"}}>{row.expirationDate||"—"}</td>
+                  <td style={{padding:"7px 10px"}}><span style={{padding:"2px 8px",borderRadius:20,fontSize:11,background:STATUS_COLORS[row.clientStatus]?.bg,color:STATUS_COLORS[row.clientStatus]?.text}}>{row.clientStatus}</span></td>
+                  <td style={{padding:"7px 10px"}}><span style={{padding:"2px 8px",borderRadius:20,fontSize:11,background:RENEWAL_COLORS[row.renewalStatus]?.bg,color:RENEWAL_COLORS[row.renewalStatus]?.text}}>{row.renewalStatus}</span></td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            <button onClick={confirmImport} style={btn}>Confirm ({importRows.length} rows)</button>
+            <button onClick={()=>setImportStep("mapping")} style={{ ...btn, color:"#888" }}>← Back</button>
+            <button onClick={()=>{ setImportStep(null); setShowImport(false); }} style={{ ...btn, color:"#888" }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Filters */}
+      <div style={{ display:"flex", gap:8, marginBottom:"0.75rem", flexWrap:"wrap" }}>
+        <input placeholder="Search entity, ORG ID, Prism ID..." value={search} onChange={e=>setSearch(e.target.value)} style={{ ...inp2, flex:1, minWidth:180 }} />
+        <select value={filterClient} onChange={e=>setFilterClient(e.target.value)} style={{ ...inp2, width:"auto" }}>
+          <option value="All">All client statuses</option>
+          {CLIENT_STATUS.map(s=><option key={s}>{s}</option>)}
+        </select>
+        <select value={filterRenewal} onChange={e=>setFilterRenewal(e.target.value)} style={{ ...inp2, width:"auto" }}>
+          <option value="All">All renewal statuses</option>
+          {RENEWAL_STATUS.map(s=><option key={s}>{s}</option>)}
+        </select>
+      </div>
+
+      {filtered.length>0 && <p style={{ fontSize:12, color:"#aaa", marginBottom:6 }}>Click any cell to edit · ⚡ = auto-managed</p>}
+
+      {/* Table */}
+      {filtered.length===0 ? (
+        <div style={{ textAlign:"center", padding:"3rem", color:"#aaa", fontSize:14 }}>
+          {entries.length===0 ? "No clients yet — click '+ Add Client' to get started." : "No results match your filters."}
+        </div>
+      ) : (
+        <div style={{ overflowX:"auto", background:"#fff", border:"0.5px solid #ddd", borderRadius:12 }}>
+          <table style={{ width:"100%", tableLayout:"fixed" }}>
+            <colgroup>
+              <col style={{width:"18%"}}/><col style={{width:"11%"}}/><col style={{width:"11%"}}/>
+              <col style={{width:"14%"}}/><col style={{width:"13%"}}/><col style={{width:"16%"}}/>
+              <col style={{width:"8%"}}/>
+            </colgroup>
+            <thead>
+              <tr style={{ borderBottom:"0.5px solid #eee" }}>
+                {cols.map(c=>(
+                  <th key={c.key} onClick={()=>handleSort(c.key)} style={{ padding:"10px 12px", textAlign:"left", fontWeight:500, fontSize:12, color:"#888", cursor:"pointer", userSelect:"none", whiteSpace:"nowrap" }}>
+                    {c.label}{sortConfig.key===c.key?(sortConfig.dir==="asc"?" ↑":" ↓"):""}
+                  </th>
+                ))}
+                <th/>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map(e=>(
+                <tr key={e.id} style={{ borderBottom:"0.5px solid #f0f0f0" }}
+                  onMouseEnter={ev=>ev.currentTarget.style.background="#fafafa"}
+                  onMouseLeave={ev=>ev.currentTarget.style.background=""}>
+                  <td style={{padding:"8px 12px"}}><TextCell value={e.entityName} onChange={v=>updateField(e.id,"entityName",v)} bold /></td>
+                  <td style={{padding:"8px 12px"}}><TextCell value={e.orgId} onChange={v=>updateField(e.id,"orgId",v)} /></td>
+                  <td style={{padding:"8px 12px"}}><TextCell value={e.prismId} onChange={v=>updateField(e.id,"prismId",v)} /></td>
+                  <td style={{padding:"8px 12px"}}><DateCell value={e.expirationDate} onChange={v=>updateField(e.id,"expirationDate",v)} /></td>
+                  <td style={{padding:"8px 12px"}}><SelectCell value={e.clientStatus} options={CLIENT_STATUS} colors={STATUS_COLORS} onChange={v=>updateField(e.id,"clientStatus",v)} /></td>
+                  <td style={{padding:"8px 12px"}}><SelectCell value={e.renewalStatus} options={RENEWAL_STATUS} colors={RENEWAL_COLORS} onChange={v=>updateField(e.id,"renewalStatus",v)} locked={e.renewalStatus==="Expiring Soon"} /></td>
+                  <td style={{padding:"8px 12px",textAlign:"right"}}>
+                    <button onClick={()=>handleDelete(e.id)} style={{ background:"none", border:"none", cursor:"pointer", color:"#A32D2D", fontSize:12 }}>Delete</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
